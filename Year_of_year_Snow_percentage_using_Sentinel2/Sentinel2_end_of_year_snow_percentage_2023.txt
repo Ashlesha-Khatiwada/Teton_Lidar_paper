@@ -1,0 +1,170 @@
+Code can be accesed at: https://code.earthengine.google.com/431e1594b3aa68cf18f6645c31847514
+// Code written and compiled by Ashlesha Khatiwada, Colorado State University
+// Last updated: August, 17, 2025
+// This code is used to calculate the end of year 2023 snow coverage in the Teton Range for specific watersheds.
+//The code outputs each watershed and the percentage of snow cover. It also output a csv file of same output. 
+//The assets are provided in the code share
+
+// =========================
+// Snow Cover Analysis in the Teton Range using Sentinel-2 L1C
+// =========================
+
+// ===== Load Assets =====
+var grte_boundary = ee.FeatureCollection('projects/ee-khatiwada/assets/Teton_lidar_range');
+var glaciers = ee.FeatureCollection('projects/ee-khatiwada/assets/Teton_Glacier');
+var watersheds = ee.FeatureCollection('projects/ee-khatiwada/assets/Watershed_inside_teton_lidar_range');
+var selectedWatersheds = ['Grizzly', 'South_Cascade', 'Mt_ST_John','Delta_lake','Skillet', 'Middle_Teton','Cloud_veil'];
+
+var glacierRaster = ee.Image.constant(1).clip(glaciers)
+  .rename('glacier').unmask(0).clip(grte_boundary);
+
+// ===== Cloud Masking for Level-1C using only QA60 =====
+function maskL1CClouds(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var cloudShadowBitMask = 1 << 12;
+
+  var cloudMask = qa.bitwiseAnd(cloudBitMask).eq(0)
+    .and(qa.bitwiseAnd(cirrusBitMask).eq(0))
+    .and(qa.bitwiseAnd(cloudShadowBitMask).eq(0));
+
+  return image.updateMask(cloudMask).divide(10000);
+}
+
+function noMask(image) {
+  return image.divide(10000);
+}
+
+// ===== Snow Threshold =====
+var snowThreshold = 0.7;
+
+// ===== NDSI + NDWI Calculation =====
+function calculateS2NDSI(image) {
+  var ndsi = image.normalizedDifference(['B3', 'B11']).rename('NDSI_CloudMasked');
+  var ndwi = image.normalizedDifference(['B3', 'B8']).rename('NDWI');
+  var waterMask = ndwi.lt(0.3).rename('WaterMask');
+  var visBrightness = image.select(['B2', 'B3', 'B4']).reduce(ee.Reducer.mean());
+  var shadowMask = visBrightness.gt(0.085).rename('ShadowMask');
+
+  var combinedMask = shadowMask.and(glacierRaster.not());
+  var ndsiMasked = ndsi.updateMask(combinedMask).rename('NDSI_Masked');
+  var snowMask = ndsiMasked.gt(snowThreshold).selfMask().rename('SnowMask');
+  var validPixels = ndsiMasked.mask().rename('ValidPixels');
+
+  return image.addBands([ndsi, ndwi, shadowMask, waterMask, ndsiMasked, snowMask, validPixels]);
+}
+
+// ===== Dates to Analyze =====
+var goodDates = {
+  2023: '2023-09-17'
+};
+
+// ===== Create Image Per Year =====
+function createSingleDateImage(dateStr, year) {
+  var date = ee.Date(dateStr);
+  var base = ee.ImageCollection('COPERNICUS/S2_HARMONIZED')
+    .filterBounds(grte_boundary)
+    .filterDate(date, date.advance(1, 'day'));
+
+  var masked = base.map(maskL1CClouds).map(calculateS2NDSI);
+  var unmasked = base.map(noMask).map(calculateS2NDSI);
+
+  var emptyImage = ee.Image.constant(0).rename('NDSI_CloudMasked')
+    .clip(grte_boundary).updateMask(ee.Image.constant(0));
+
+  var mosaic = ee.Algorithms.If(
+    masked.size().gt(0),
+    masked.mosaic().clip(grte_boundary),
+    ee.Algorithms.If(unmasked.size().gt(0), unmasked.mosaic().clip(grte_boundary), emptyImage)
+  );
+
+  return ee.Image(mosaic).set('year', year);
+}
+
+// ===== Compute Snow % in Each Watershed =====
+function computeSnowFraction(ndsiImage, year, watershed) {
+  var geometry = watershed.geometry();
+  var validLand = ndsiImage.select('NDSI_Masked').mask();
+  var snowMask = validLand.updateMask(ndsiImage.select('NDSI_Masked').gt(snowThreshold));
+
+  var totalPixels = validLand.reduceRegion({
+    reducer: ee.Reducer.count(),
+    geometry: geometry,
+    scale: 10,
+    maxPixels: 1e13
+  }).get('NDSI_Masked');
+
+  var snowPixels = snowMask.reduceRegion({
+    reducer: ee.Reducer.count(),
+    geometry: geometry,
+    scale: 10,
+    maxPixels: 1e13
+  }).get('NDSI_Masked');
+
+  var snowPercent = ee.Algorithms.If(
+    ee.Number(totalPixels).gt(0),
+    ee.Number(snowPixels).divide(ee.Number(totalPixels)).multiply(100),
+    0
+  );
+
+  var pixelArea = ee.Number(100); // 10m x 10m
+  var snowArea = ee.Number(snowPixels).multiply(pixelArea).divide(1e6); // km2
+  var validArea = ee.Number(totalPixels).multiply(pixelArea).divide(1e6);
+
+  return watershed.set({
+    'year': year,
+    'snow_px': snowPixels,
+    'tot_pix': totalPixels,
+    'snow_pct': snowPercent,
+    'snow_km2': snowArea,
+    'valid_km2': validArea
+  });
+}
+
+// ===== Loop Through Years =====
+Object.keys(goodDates).forEach(function(yearStr) {
+  var year = parseInt(yearStr);
+  var dateStr = goodDates[year];
+  var ndsiImage = createSingleDateImage(dateStr, year);
+
+  var rawImage = ee.ImageCollection('COPERNICUS/S2')
+    .filterBounds(grte_boundary)
+    .filterDate(dateStr, ee.Date(dateStr).advance(1, 'day'))
+    .first();
+
+  Map.addLayer(rawImage.clip(grte_boundary), {bands: ['B4', 'B3', 'B2'], min: 0, max: 3000, gamma: 1.3}, 'Raw Sentinel-2 ' + year);
+  Map.addLayer(ndsiImage.select('NDSI_CloudMasked'), {min: -1, max: 1, palette: ['green', 'white', 'blue']}, 'NDSI Cloud-Masked ' + year);
+  Map.addLayer(ndsiImage.select('NDSI_Masked'), {min: -1, max: 1, palette: ['green', 'white', 'blue']}, 'NDSI Masked ' + year);
+  Map.addLayer(ndsiImage.select('SnowMask'), {palette: ['white']}, 'Snow Mask ' + year);
+  //Map.addLayer(ndsiImage.select('ValidPixels'), {palette: ['gray']}, 'Valid Pixels ' + year);
+  //Map.addLayer(ndsiImage.select('ShadowMask'), {palette: ['purple']}, 'Shadow Mask ' + year);
+  //Map.addLayer(ndsiImage.select('WaterMask'), {palette: ['blue']}, 'Water Mask ' + year);
+
+  var selected = watersheds.filter(ee.Filter.inList('Name', selectedWatersheds));
+  Map.addLayer(selected.style({color: 'yellow', fillColor: '00000000'}), {}, 'Selected Watersheds ' + year);
+
+  var results = selected.map(function(watershed) {
+    return computeSnowFraction(ndsiImage, year, watershed);
+  });
+
+  results.evaluate(function(fc) {
+    print('--- Snow Fraction Results for ' + year + ' ---');
+    fc.features.forEach(function(f) {
+      var props = f.properties;
+      print(props.Name + ': ' + props.snow_pct.toFixed(2) + '% (' + props.snow_km2.toFixed(2) + ' km^2 of ' + props.valid_km2.toFixed(2) + ' km^2)');
+    });
+  });
+
+  Export.table.toDrive({
+    collection: results,
+    description: 'Watersheds_SnowPct_L1C_' + year,
+    folder: 'NDSI_Teton_L1C',
+    fileFormat: 'SHP'
+  });
+});
+
+Map.centerObject(grte_boundary, 10);
+//ap.addLayer(glacierRaster, {min: 0, max: 1, palette: ['cyan']}, 'Glacier Mask');
+Map.addLayer(glaciers, {color: 'cyan'}, 'Glacier Polygons');
+Map.addLayer(watersheds.style({ color: 'red', fillColor: '00000000' }), {}, 'Watersheds');
